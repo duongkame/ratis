@@ -35,6 +35,8 @@ import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.server.util.ServerStringUtils;
 import org.apache.ratis.thirdparty.io.grpc.stub.CallStreamObserver;
+import org.apache.ratis.thirdparty.io.grpc.stub.ClientCallStreamObserver;
+import org.apache.ratis.thirdparty.io.grpc.stub.ClientResponseObserver;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
 import org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto;
 import org.apache.ratis.proto.RaftProtos.AppendEntriesRequestProto;
@@ -53,6 +55,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 
 /**
  * A new log appender implementation using grpc bi-directional stream API.
@@ -476,19 +479,31 @@ public class GrpcLogAppender extends LogAppenderBase {
     }
   }
 
-  private class InstallSnapshotResponseHandler implements StreamObserver<InstallSnapshotReplyProto> {
+  /**
+   * Handler for snapshot installing using manual control.
+   * With manual flow-control and back-pressure on the client, the ClientResponseObserver handles both
+   * request and response streams.
+   */
+  private class InstallSnapshotHandler implements ClientResponseObserver<InstallSnapshotRequestProto, InstallSnapshotReplyProto> {
     private final String name = getFollower().getName() + "-" + JavaUtils.getClassSimpleName(getClass());
     private final Queue<Integer> pending;
     private final AtomicBoolean done = new AtomicBoolean(false);
     private final boolean isNotificationOnly;
+    final BiConsumer<CallStreamObserver<InstallSnapshotRequestProto>, InstallSnapshotHandler>
+        streamExecutor;
 
-    InstallSnapshotResponseHandler() {
-      this(false);
+    ClientCallStreamObserver<InstallSnapshotRequestProto> requestStream;
+
+    InstallSnapshotHandler(
+        BiConsumer<CallStreamObserver<InstallSnapshotRequestProto>, InstallSnapshotHandler> streamExecutor) {
+      this(false, streamExecutor);
     }
 
-    InstallSnapshotResponseHandler(boolean notifyOnly) {
+    InstallSnapshotHandler(boolean notifyOnly,
+        BiConsumer<CallStreamObserver<InstallSnapshotRequestProto>, InstallSnapshotHandler> streamExecutor) {
       pending = new LinkedList<>();
       this.isNotificationOnly = notifyOnly;
+      this.streamExecutor = streamExecutor;
     }
 
     void addPending(InstallSnapshotRequestProto request) {
@@ -541,6 +556,8 @@ public class GrpcLogAppender extends LogAppenderBase {
         LOG.info("{}: received {} reply {}", this, firstResponseReceived ? "a" : "the first",
             ServerStringUtils.toInstallSnapshotReplyString(reply));
       }
+
+      requestStream.request(1);
 
       // update the last rpc time
       getFollower().updateLastRpcResponseTime();
@@ -628,6 +645,17 @@ public class GrpcLogAppender extends LogAppenderBase {
     public String toString() {
       return name;
     }
+
+    @Override
+    public void beforeStart(
+        ClientCallStreamObserver<InstallSnapshotRequestProto> requestStream) {
+      this.requestStream = requestStream;
+      requestStream.disableAutoRequestWithInitial(1);
+      requestStream.setOnReadyHandler(() -> {
+        streamExecutor.accept(requestStream, this);
+      });
+    }
+
   }
 
   /**
@@ -638,29 +666,40 @@ public class GrpcLogAppender extends LogAppenderBase {
     LOG.info("{}: followerNextIndex = {} but logStartIndex = {}, send snapshot {} to follower",
         this, getFollower().getNextIndex(), getRaftLog().getStartIndex(), snapshot);
 
-    final InstallSnapshotResponseHandler responseHandler = new InstallSnapshotResponseHandler();
-    StreamObserver<InstallSnapshotRequestProto> snapshotRequestObserver = null;
+
     final String requestId = UUID.randomUUID().toString();
-    try {
-      snapshotRequestObserver = getClient().installSnapshot(
-          getFollower().getName() + "-installSnapshot-" + requestId,
-          installSnapshotStreamTimeout, maxOutstandingInstallSnapshots, responseHandler);
-      for (InstallSnapshotRequestProto request : newInstallSnapshotRequests(requestId, snapshot)) {
-        if (isRunning()) {
-          snapshotRequestObserver.onNext(request);
-          getFollower().updateLastRpcSendTime(false);
-          responseHandler.addPending(request);
-        } else {
-          break;
+    Iterator<InstallSnapshotRequestProto> installSnapshotRequests =
+        newInstallSnapshotRequests(requestId, snapshot).iterator();
+
+    BiConsumer<CallStreamObserver<InstallSnapshotRequestProto>, InstallSnapshotHandler>
+        executeStream = (requestStream, responseHandler) -> {
+      while (requestStream.isReady()) {
+        try {
+          if (installSnapshotRequests.hasNext() && isRunning()) {
+            InstallSnapshotRequestProto request =
+                installSnapshotRequests.next();
+            requestStream.onNext(request);
+            getFollower().updateLastRpcSendTime(false);
+            responseHandler.addPending(request);
+          } else {
+            requestStream.onCompleted();
+            grpcServerMetrics.onInstallSnapshot();
+          }
+        } catch (Exception e) {
+          requestStream.onError(e);
         }
       }
-      snapshotRequestObserver.onCompleted();
-      grpcServerMetrics.onInstallSnapshot();
-    } catch (Exception e) {
-      LOG.warn("{}: failed to install snapshot {}: {}", this, snapshot.getFiles(), e);
-      if (snapshotRequestObserver != null) {
-        snapshotRequestObserver.onError(e);
-      }
+    };
+
+    final InstallSnapshotHandler responseHandler = new InstallSnapshotHandler(executeStream);
+    try {
+      getClient().installSnapshot(
+          getFollower().getName() + "-installSnapshot-" + requestId,
+          installSnapshotStreamTimeout, maxOutstandingInstallSnapshots,
+          responseHandler);
+    } catch (IOException e) {
+      LOG.warn("{}: failed to install snapshot {}: {}", this,
+          snapshot.getFiles(), e);
       return;
     }
 
@@ -686,26 +725,33 @@ public class GrpcLogAppender extends LogAppenderBase {
     LOG.info("{}: followerNextIndex = {} but logStartIndex = {}, notify follower to install snapshot-{}",
         this, getFollower().getNextIndex(), getRaftLog().getStartIndex(), firstAvailableLogTermIndex);
 
-    final InstallSnapshotResponseHandler responseHandler = new InstallSnapshotResponseHandler(true);
-    StreamObserver<InstallSnapshotRequestProto> snapshotRequestObserver = null;
-    // prepare and enqueue the notify install snapshot request.
-    final InstallSnapshotRequestProto request = newInstallSnapshotNotificationRequest(firstAvailableLogTermIndex);
-    if (LOG.isInfoEnabled()) {
-      LOG.info("{}: send {}", this, ServerStringUtils.toInstallSnapshotRequestString(request));
-    }
+    BiConsumer<CallStreamObserver<InstallSnapshotRequestProto>, InstallSnapshotHandler>
+        streamExecutor = (requestStream, responseHandler) -> {
+      if (requestStream.isReady()) {
+        try {
+          final InstallSnapshotRequestProto request =
+              newInstallSnapshotNotificationRequest(firstAvailableLogTermIndex);
+          if (LOG.isInfoEnabled()) {
+            LOG.info("{}: send {}", this,
+                ServerStringUtils.toInstallSnapshotRequestString(request));
+          }
+          requestStream.onNext(request);
+          getFollower().updateLastRpcSendTime(false);
+          responseHandler.addPending(request);
+          requestStream.onCompleted();
+        } catch (Exception e) {
+          requestStream.onError(e);
+        }
+      }
+    };
+
+    final InstallSnapshotHandler responseHandler = new InstallSnapshotHandler(true, streamExecutor);
     try {
-      snapshotRequestObserver = getClient().installSnapshot(getFollower().getName() + "-notifyInstallSnapshot",
+      getClient().installSnapshot(getFollower().getName() + "-notifyInstallSnapshot",
           requestTimeoutDuration, 0, responseHandler);
 
-      snapshotRequestObserver.onNext(request);
-      getFollower().updateLastRpcSendTime(false);
-      responseHandler.addPending(request);
-      snapshotRequestObserver.onCompleted();
-    } catch (Exception e) {
+    } catch (IOException e) {
       GrpcUtil.warn(LOG, () -> this + ": Failed to notify follower to install snapshot.", e);
-      if (snapshotRequestObserver != null) {
-        snapshotRequestObserver.onError(e);
-      }
       return;
     }
 
