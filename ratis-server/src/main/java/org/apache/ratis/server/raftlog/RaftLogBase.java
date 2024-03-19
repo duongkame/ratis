@@ -17,9 +17,6 @@
  */
 package org.apache.ratis.server.raftlog;
 
-import java.io.Serializable;
-import java.util.Arrays;
-import java.util.LinkedList;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.proto.RaftProtos.LogEntryProto;
