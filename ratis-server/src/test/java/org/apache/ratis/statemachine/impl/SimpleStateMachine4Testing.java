@@ -202,6 +202,9 @@ public class SimpleStateMachine4Testing extends BaseStateMachine {
   private void put(ReferenceCountedObject<LogEntryProto> entryRef) {
     LogEntryProto entry = entryRef.retain();
     final ReferenceCountedObject<LogEntryProto> previous = indexMap.put(entry.getIndex(), entryRef);
+    if (previous != null) {
+      previous.release();
+    }
     Preconditions.assertNull(previous, "previous");
     final String s = entry.getStateMachineLogEntry().getLogData().toStringUtf8();
     dataMap.put(s, entry);
@@ -379,10 +382,11 @@ public class SimpleStateMachine4Testing extends BaseStateMachine {
   @Override
   public void close() {
     getLifeCycle().checkStateAndClose(() -> {
+      LOG.info("Closing {}.", this.getClass().getSimpleName());
+      indexMap.values().forEach(ReferenceCountedObject::release);
       running = false;
       checkpointer.interrupt();
     });
-    indexMap.values().forEach(ReferenceCountedObject::release);
   }
 
   public LogEntryProto[] getContent() {
