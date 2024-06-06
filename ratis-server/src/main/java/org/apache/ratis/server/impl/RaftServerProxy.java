@@ -649,11 +649,14 @@ class RaftServerProxy implements RaftServer {
   public CompletableFuture<AppendEntriesReplyProto> appendEntriesAsync(
       ReferenceCountedObject<AppendEntriesRequestProto> requestRef) {
     AppendEntriesRequestProto request = requestRef.retain();
+    int hash = request.hashCode();
+    LOG.info("Starting {}", hash);
     try {
       final RaftGroupId groupId = ProtoUtils.toRaftGroupId(request.getServerRequest().getRaftGroupId());
       return getImplFuture(groupId)
           .thenCompose(impl -> impl.executeSubmitServerRequestAsync(() -> impl.appendEntriesAsync(requestRef)));
     } finally {
+      LOG.info("Ending {}", hash);
       requestRef.release();
     }
   }
