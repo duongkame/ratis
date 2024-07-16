@@ -18,6 +18,7 @@
 package org.apache.ratis.server.leader;
 
 import org.apache.ratis.util.Daemon;
+import org.apache.ratis.util.ExitUtils;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.LifeCycle;
 
@@ -88,6 +89,7 @@ class LogAppenderDaemon {
     } catch (Throwable e) {
       LOG.warn(this + " failed", e);
       lifeCycle.transitionIfValid(EXCEPTION);
+      ExitUtils.terminate(1, this + " failed", e, LOG);
     } finally {
       final State finalState = lifeCycle.transitionAndGet(TRANSITION_FINALLY);
       if (finalState == EXCEPTION) {
