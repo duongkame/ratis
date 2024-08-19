@@ -431,7 +431,8 @@ public final class SegmentedRaftLog extends RaftLogBase {
           context::wrap : ReferenceCountedObject::wrap;
       if (stateMachineCachingEnabled) {
         // The stateMachineData will be cached inside the StateMachine itself.
-        cache.appendEntry(LogSegment.Op.WRITE_CACHE_WITH_STATE_MACHINE_CACHE, wrap.apply(removedStateMachineData));
+        cache.appendEntry(LogSegment.Op.WRITE_CACHE_WITH_STATE_MACHINE_CACHE,
+            ReferenceCountedObject.wrap(removedStateMachineData));
       } else {
         cache.appendEntry(LogSegment.Op.WRITE_CACHE_WITHOUT_STATE_MACHINE_CACHE, wrap.apply(entry)
         );
